@@ -33,8 +33,12 @@ static struct argp_option options[] = {
     { "prober-cpu",  'p', "NUM", 0, "Prober thread CPU number",          11 },
     { "address",     'x', "HEX", 0, "Target address (disable ASLR)",     12 },
     { "name",        'n', "STR", 0, "Target symbol name",                12 },
-    { "outlier-ths", 't', "NUM", 0, "Outlier threshold [cycles]",        13 },
-    { "wait-time",   'w', "NUM", 0, "Wait time after eviction [μs]",     13 },
+    { "probe-lag",   'l', "NUM", 0, "Wait time after eviction [μs]",     13 },
+
+    { NULL, 0, NULL, 0, "Runtime statistics", 20 },
+    { "outlier-ths", 't', "NUM", 0, "Outlier threshold [cycles]",        20 },
+    { "window-sz",   'w', "NUM", 0, "Moving average window size",        20 },
+
 
     { 0 },
 };
@@ -48,8 +52,9 @@ static uint8_t  evict_by_code;
 static uint32_t evictor_cpu;
 static uint32_t prober_cpu;
 static uint64_t target_addr;
-static uint64_t outlier_threshold;
 static uint64_t wait_time;
+static uint64_t outlier_threshold;
+static uint64_t window_size;
 
 /* parser configuration parameters */
 static error_t parse_opt(int32_t, char *, struct argp_state *);
@@ -98,15 +103,21 @@ error_t parse_opt(int key, char *arg, struct argp_state *state)
             target_addr = (uint64_t) dlsym(RTLD_DEFAULT, arg);
             RET(!target_addr, EINVAL, "Unable to resolve symbol %s", arg);
             break;
+        case 'l':   /* wait time between eviction and probe */
+            sscanf(arg, "%lu", &wait_time);
+            break;
         case 't':   /* outlier load time threshold */
             sscanf(arg, "%lu", &outlier_threshold);
             break;
-        case 'w':   /* wait time between eviction and probe */
-            sscanf(arg, "%lu", &wait_time);
+        case 'w':   /* latency moving average window size */
+            sscanf(arg, "%lu", &window_size);
             break;
         case ARGP_KEY_END:  /* executes after all arguments were parsed */
             cache_size = cache_sets * cache_associativity * cache_coherency;
             RET(!cache_size, EINVAL, "Specify all cache arguments!");
+            RET(!target_addr, EINVAL, "Specify target address or symbol name!");
+            RET(!outlier_threshold, EINVAL, "Specify outlier threshold!");
+            RET(!window_size, EINVAL, "Specify moving average window size!");
             break;
         default:    /* unknown argument */
             return ARGP_ERR_UNKNOWN;
@@ -286,12 +297,13 @@ void *evictor_main(void *data)
  */
 void *prober_main(void *data)
 {
-    sem_t       *semaphores = data;     /* reference to semaphores     */
-    cpu_set_t   cpuset;                 /* thread affinity cpu set     */
-    uint64_t    delta;                  /* memory probe duration       */
-    uint64_t    total_time  = 0;        /* total memory probe duration */
-    uint64_t    samples     = 0;        /* number of memory probes     */
-    int32_t     ans;                    /* answer                      */
+    sem_t       *semaphores = data;     /* reference to semaphores        */
+    cpu_set_t   cpuset;                 /* thread affinity cpu set        */
+    uint64_t    delta;                  /* single memory probe duration   */
+    uint64_t    total_time = 0;         /* windowed memory probe duration */
+    uint64_t    *avg_window;            /* sample window buffer           */
+    uint64_t    window_head = 0;        /* sample window head             */
+    int32_t     ans;                    /* answer                         */
 
     /* set cpu affinity */
     CPU_ZERO(&cpuset);
@@ -299,6 +311,11 @@ void *prober_main(void *data)
 
     ans = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
     DIE(ans, "Unable to set cpu affinity (%s)", strerror(errno));
+
+    /* allocate and zero out sample window */
+    avg_window = calloc(window_size, sizeof(delta));
+    DIE(!avg_window, "Unable to allocate sample window buffer (%s)",
+        strerror(errno));
 
     /* main prober loop (alternating with evictor) */
     while (1) {
@@ -309,14 +326,15 @@ void *prober_main(void *data)
         /* perform memory access time measurement */
         delta = probe((void *) target_addr);
 
-        /* update life-long stats if access time below outlier threshold */
+        /* update window if access time below outlier threshold */
         if (delta < outlier_threshold) {
-            total_time += delta;
-            samples++;
+            total_time += delta - avg_window[window_head];
+            avg_window[window_head++] = delta;
+            window_head %= window_size;
         }
 
         INFO("Access time is: %5lu cycles | Average: %5lu cycles",
-             delta, total_time / samples);
+             delta, total_time / window_size);
 
         /* let evictor start up again */
         ans = sem_post(&semaphores[1]);
