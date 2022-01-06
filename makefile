@@ -7,7 +7,7 @@ INC = include
 # compilation related parameters
 CC      = gcc
 CFLAGS  = -ggdb
-LDFLAGS = -lpthread
+LDFLAGS = -lpthread -ldl
 
 # identify sources; generate objects and final binary targets
 SOURCES = $(wildcard $(SRC)/*.c)

@@ -7,6 +7,7 @@
 #include <semaphore.h>  /* sem_{init,wait,post}          */
 #include <argp.h>       /* argp_parse, etc.              */
 #include <unistd.h>     /* usleep                        */
+#include <dlfcn.h>      /* dlsym                         */
 
 #include "util.h"
 
@@ -31,6 +32,7 @@ static struct argp_option options[] = {
     { "evictor-cpu", 'e', "NUM", 0, "Evictor thread CPU number",         11 },
     { "prober-cpu",  'p', "NUM", 0, "Prober thread CPU number",          11 },
     { "address",     'x', "HEX", 0, "Target address (disable ASLR)",     12 },
+    { "name",        'n', "STR", 0, "Target symbol name",                12 },
     { "outlier-ths", 't', "NUM", 0, "Outlier threshold [cycles]",        13 },
     { "wait-time",   'w', "NUM", 0, "Wait time after eviction [μs]",     13 },
 
@@ -91,6 +93,10 @@ error_t parse_opt(int key, char *arg, struct argp_state *state)
             break;
         case 'x':   /* target address */
             sscanf(arg, "%lx", &target_addr);
+            break;
+        case 'n':   /* target symbol name ==> address */
+            target_addr = (uint64_t) dlsym(RTLD_DEFAULT, arg);
+            RET(!target_addr, EINVAL, "Unable to resolve symbol %s", arg);
             break;
         case 't':   /* outlier load time threshold */
             sscanf(arg, "%lu", &outlier_threshold);
@@ -212,8 +218,6 @@ void dcache_evict(void *data, uint64_t size)
  *
  * This should run on the same physical core as the victim, but not necessarily
  * on the same logical core.
- *
- * TODO: implement some form of IPC between this and prober_main()
  */
 void *evictor_main(void *data)
 {
@@ -342,14 +346,10 @@ int32_t main(int32_t argc, char *argv[])
     ans = argp_parse(&argp, argc, argv, 0, 0, NULL);
     DIE(ans, "Error parsing command line arguments");
 
-    /* small hack, overwrite target_addr here *
-     * works only with this victim            */
-    target_addr = (uint64_t) toupper;
-
-    /* initialize semaphores (evictor goes first)                          *
-     * NOTE: we want to avoid global variables for semaphores, but they    *
-     *       can reside on stack (i.e.: be function-local); so we put them *
-     *       in .bss by making them static                                 */
+    /* initialize semaphores (evictor goes first)                       *
+     * NOTE: we want to avoid global variables for semaphores, but they *
+     *       can't reside on stack (i.e.: be function-local); so we put *
+     *       them in .bss by making them static                         */
     for (size_t i = 0; i < 2; i++) {
         ans = sem_init(&semaphores[i], 0, i);
         DIE(ans, "Unable to initialize semaphore (%s)", strerror(errno));
