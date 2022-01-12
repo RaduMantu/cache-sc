@@ -1,15 +1,18 @@
-#define _GNU_SOURCE     /* ensure inclusion of CPU_{ZERO,SET} */
-
 #include <stdint.h>     /* [u]int*_t                     */
-#include <sys/mman.h>   /* m[un]map                      */
+#include <sys/mman.h>   /* m{[un]map,lock}               */
 #include <sched.h>      /* CPU_{ZERO,SET}                */
 #include <pthread.h>    /* pthread_{setaffinity_np,self} */
 #include <semaphore.h>  /* sem_{init,wait,post}          */
 #include <argp.h>       /* argp_parse, etc.              */
-#include <unistd.h>     /* usleep                        */
+#include <unistd.h>     /* usleep, pread, close          */
 #include <dlfcn.h>      /* dlsym                         */
+#include <fcntl.h>      /* open                          */
+
+#include <vector>       /* vector                        */
 
 #include "util.h"
+
+using namespace std;
 
 /******************************************************************************
  **************************** CLI ARGUMENT PARSING ****************************
@@ -125,6 +128,7 @@ error_t parse_opt(int key, char *arg, struct argp_state *state)
 
     return 0;
 }
+
 /******************************************************************************
  ******************************* CACHE PROBING ********************************
  ******************************************************************************/
@@ -210,7 +214,10 @@ void icache_evict(void *code, uint64_t size)
  */
 void dcache_evict(void *data, uint64_t size)
 {
-    for (uint64_t *p = data; (void *) p < data + size; p++)
+    for (uint64_t *p = (uint64_t *) data;
+         (uint8_t *) p < (uint8_t *) data + size;
+         p++)
+    {
         asm __volatile__ (
             ".intel_syntax      \n"
             "mov    %%rbx, [%0] \n"
@@ -218,7 +225,284 @@ void dcache_evict(void *data, uint64_t size)
         :
         : "r" (p)
         );
+    }
 }
+
+/******************************************************************************
+ *************************** CACHE BUFFER ALLOCATOR ***************************
+ ******************************************************************************/
+
+/* single entry from /proc/<pid>/pagemap */
+struct pagemap_entry {
+    uint64_t pfn          : 55;     /* 54 - 0  | page frame number   */
+    uint64_t dirty        :  1;     /* 55      | soft dirty          */
+    uint64_t exclusive    :  1;     /* 56      | exclusively mapped  */
+    uint64_t reserved     :  4;     /* 60 - 57 | zero                */
+    uint64_t file_page    :  1;     /* 61      | file-backed         */
+    uint64_t page_swapped :  1;     /* 62      | swapped             */
+    uint64_t page_preset  :  1;     /* 63      | resident in RAM     */
+};
+
+/* PCM allocator - page accounting structure */
+struct page_attr {
+    uint64_t pfn;       /* page frame number                  */
+    uint64_t va;        /* virtual address                    */
+    uint32_t cfb;       /* length of continuous forward block */
+    uint32_t reserved;  /* structure is padded to 24B anyway  */
+};
+
+/* get_pagemap_entry - retrieves pagemap entry for given virtual address
+ *  @addr : virtual address (will be truncated to 4K page address)
+ *  @pme  : pointer to an already allocated pagemap_entry
+ *  @fd   : descriptor of an open /proc/<pid>/pagemap
+ *
+ *  @return : 0 if everything went well
+ *
+ * If this function returns a zeroed pme, one of two things happened:
+ *  - virtual address was invalid
+ *  - underlying page was not faulted in
+ */
+int32_t get_pagemap_entry(uint64_t addr, struct pagemap_entry *pme, int32_t fd)
+{
+    int32_t ans;
+
+    /* fetch structure from pagemap file */
+    ans = pread(fd, (void *) pme, sizeof(*pme), (addr >> 12) * sizeof(*pme));
+    RET(ans == -1, 1, "Unable to read PME for addr %p (%s)",
+        (void *) addr, strerror(errno));
+
+    return 0;
+}
+
+/* get_unmapped_space - finds empty location in virtual address space
+ *  @size     : size of unallocated void space
+ *  @prev_off : minimum offset from previous mapped section
+ *  @next_off : minimum offset from following mapped section
+ *
+ *  @return : page aligned pointer to unmmaped page address or NULL on error
+ *
+ * All arguments _should_ be page aligned.
+ */
+void *get_unmapped_space(uint64_t size, uint64_t prev_off, uint64_t next_off)
+{
+    char     *buf;              /* line buffer                   */
+    size_t   buf_sz = 0;        /* line buffer size              */
+    FILE     *f;                /* maps file stream              */
+    ssize_t  ans;               /* answer                        */
+    uint64_t prev_sec_end;      /* previous section end address  */
+    uint64_t curr_sec_start;    /* current section start address */
+    uint64_t curr_sec_end;      /* current section end address   */
+    uint64_t required_space;    /* total required space          */
+    uint64_t ret = 0;           /* return value                  */
+
+    required_space = size + prev_off + next_off;
+
+    /* unknown file size; cleanest way to parse is with getline() */
+    f = fopen("/proc/self/maps", "r");
+    GOTO(!f, get_unmapped_space_out, "Unable to open /proc/self/maps (%s)",
+        strerror(errno));
+
+    /* get an initial value for previous section reference */
+    ans = getline(&buf, &buf_sz, f);
+    GOTO(ans == -1, get_unmapped_space_out, "Unable to read maps (%s)",
+        strerror(errno));
+    sscanf(buf, "%*lx-%lx", &prev_sec_end);
+
+    /* continue parsing lines until a suitable space is identified */
+    while (1) {
+        ans = getline(&buf, &buf_sz, f);
+        GOTO(ans == -1, get_unmapped_space_out, "Unable to read maps (%s)",
+            strerror(errno));
+        sscanf(buf, "%lx-%lx", &curr_sec_start, &curr_sec_end);
+
+        /* check if space between maps is sufficient */
+        if (curr_sec_start - prev_sec_end > required_space) {
+            ret = prev_sec_end + prev_off;
+            break;
+        }
+
+        /* current section becomes previous section */
+        prev_sec_end = curr_sec_end;
+    }
+
+get_unmapped_space_out:
+    /* cleanup */
+    fclose(f);
+    free(buf);
+
+    return (void *) (ret & ~4095);
+}
+
+/* insert_page - inserts a page accounting structure into a std::vector
+ *  @v  : vector containing accounting structures for all allocated pages
+ *  @as : accounting structure to be inserted
+ *
+ *  @return : starting index of the physically continuous block containing the
+ *            page whose accouting structure was just inserted
+ *
+ * The .cfb field contains the total length (in pages) of the physically
+ * continuous memory block starting with that page. If the insertion extends
+ * such a block (either by itself or by linking two blocks), all linked
+ * structures leading up to it will also be updated.
+ */
+uint32_t insert_page(vector<struct page_attr>& v, struct page_attr& as)
+{
+    int64_t lb, rb, mid;        /* binary search auxiliary variables */
+    int32_t head;               /* return value                      */
+
+    /* set initial search bounds */
+    lb = 0;
+    rb = v.size() - 1;
+
+    /* do binary search for left insert location */
+    while (lb <= rb) {
+        /* exact match should be impossible */
+        mid = (lb + rb) / 2;
+        if (unlikely(as.pfn == v[mid].pfn)) {
+            WAR("PFN collision detected: %#lx", as.pfn);
+
+            lb = mid;
+            break;
+        }
+
+        /* adjust bounds */
+        if (as.pfn < v[mid].pfn)
+            rb = mid - 1;
+        else
+            lb = mid + 1;
+    }
+
+    /* perform insertion */
+    v.insert(v.begin() + lb, as);
+
+    /* establish number of consecutive pages starting with inserted one */
+    v[lb].cfb = (lb != v.size() - 1) && (v[lb].pfn == v[lb + 1].pfn - 1)
+              ? v[lb + 1].cfb + 1
+              : 1;
+
+    /* update cfb for previous pages of the same block (if any) */
+    for (head = lb - 1; head >= 0; head--)
+        if (v[head].pfn == v[head + 1].pfn - 1)
+            v[head].cfb = v[head + 1].cfb + 1;
+        else
+            break;
+
+    /* return head of continuous page block containing inserted element */
+    return (uint32_t) head + 1;
+}
+
+/* pcmalloc - physically continuous memory page allocator
+ *  @num_pages : number of pages to allocate
+ *  @prot      : mmap protection flags (applied to all pages)
+ *
+ *  @return : virtual start address of continuous physical block
+ *
+ * NOTE: this block can not be freed by calling free(); use pcfree() instead.
+ */
+void *pcmalloc(uint32_t num_pages, int32_t prot)
+{
+    static int32_t           fd = -1;               /* /proc/self/pagemap  */
+    uint64_t                 remap_addr;            /* remapping base addr */
+    uint32_t                 max_block_size = 0;    /* largest block size  */
+    uint32_t                 max_block_head;        /* largest block start */
+    uint32_t                 head;                  /* current block start */
+    int32_t                  ans;                   /* answer              */
+    struct pagemap_entry     pme;                   /* pagemap entry       */
+    struct page_attr         as;                    /* accounting unit     */
+    vector<struct page_attr> acc;                   /* page accounting     */
+
+    /* first time open on /proc/self/pagemap                   *
+     * NOTE: lack of CAP_SYS_ADMIN will not cause this to fail *
+     *       instead, all reads will yield zero buffers        */
+    if (fd == -1) {
+        fd = open("/proc/self/pagemap", O_RDONLY);
+        RET(fd == -1, NULL, "Unable to open pagemap (%s)", strerror(errno));
+    }
+
+    /* the idea here is to over-allocate pages until continuous blocks emerge.
+     * we keep doing this until a large enough block is identified.
+     * the mmap()-ed pages will have to be locked as resident in main memory.
+     * this will most likely _nearly_ exhaust your computer's free RAM.
+     * if the RAM is expended before a suitable block is found, either mmap()
+     * will fail (leading to an exit() call), or the process will be terminated
+     * by the OOM killer.
+     */
+    do {
+        /* allocate a page (assuming 4K pages) */
+        as.va = (uint64_t) mmap(NULL, 4096, prot,
+                            MAP_PRIVATE | MAP_ANON, -1, 0);
+        RET(as.va == (uint64_t) MAP_FAILED, NULL,
+            "Unable to allocate page (%s)", strerror(errno));
+
+        /* fault page in & lock it in ram */
+        ans = mlock((void *) as.va, 4096);
+        RET(ans == -1, NULL, "Unable to lock page in RAM (%s)",
+            strerror(errno));
+
+        /* obtain pagemap entry & extract pfn */
+        ans = get_pagemap_entry(as.va, &pme, fd);
+        RET(ans, NULL, "UnabCAP_SYS_ADMINle to obtain pagemap entry");
+        RET(!pme.pfn, NULL, "Invalid PFN");
+        as.pfn = pme.pfn;
+
+        /* add newly allocated page to accouting */
+        head = insert_page(acc, as);
+
+        /* update new maximum block size if necessary */
+        if (acc[head].cfb > max_block_size) {
+            max_block_size = acc[head].cfb;
+            max_block_head = head;
+
+            DEBUG("Largest physical block: %u / %u [pages]",
+                max_block_size, num_pages);
+        }
+    } while (max_block_size < num_pages);
+
+    /* free pages that are not part of the desired block */
+    for (auto it = acc.begin(); it < acc.begin() + max_block_head; it++) {
+        ans = munmap((void *) it->va, 4096);
+        ALERT(ans == -1, "Unable to unmap page (%s)", strerror(errno));
+    }
+    acc.erase(acc.begin(), acc.begin() + max_block_head);
+
+    for (auto it = acc.begin() + num_pages; it < acc.end(); it++) {
+        ans = munmap((void *) it->va, 4096);
+        ALERT(ans == -1, "Unable to unmap page (%s)", strerror(errno));
+    }
+    acc.erase(acc.begin() + num_pages, acc.end());
+
+    /* find an empty virtual address space range to reorder blocks *
+     * require a 16MB blinding area around it (on each side)       */
+    remap_addr = (uint64_t) get_unmapped_space(num_pages << 12,
+                                0x1000000, 0x1000000);
+    GOTO(!remap_addr, pcmalloc_err, "Unable to get remap address");
+
+    /* reorder physical block pages into a cohesive virtual block */
+    for (size_t i = 0; i < acc.size(); i++) {
+        void *rma = mremap((void *) acc[i].va, 4096, 4096,
+                        MREMAP_MAYMOVE | MREMAP_FIXED,
+                        (void *) (remap_addr + i * 4096));
+        GOTO(rma == MAP_FAILED, pcmalloc_err, "Unable to remap address (%s)",
+            strerror(errno));
+
+        /* update accouting va in case we have to clean up on error */
+        acc[i].va = (uint64_t) rma;
+    }
+
+    /* everything went well; bypass error cleanup */
+    goto pcmalloc_out;
+pcmalloc_err:
+    /* clean up after error */
+    for (auto& it : acc) {
+        ans = munmap((void *) it.va, 4096);
+        ALERT(ans == -1, "Unable to unmap page (%s)", strerror(errno));
+    }
+
+pcmalloc_out:
+    return (void *) remap_addr;
+}
+
+/* TODO: implement cmfree() */
 
 /******************************************************************************
  ************************* CORE SPECIFIC MAIN THREADS *************************
@@ -235,9 +519,12 @@ void *evictor_main(void *data)
     void (*evict)(void *, uint64_t);    /* cache eviction function  */
     uint8_t     *buffer;                /* anon mapped cache buffer */
     int32_t     prot;                   /* buffer protection mode   */
-    sem_t       *semaphores = data;     /* reference to semaphores  */
+    sem_t       *semaphores;            /* reference to semaphores  */
     cpu_set_t   cpuset;                 /* thread affinity cpu set  */
     int32_t     ans;                    /* answer                   */
+
+    /* cast data to sem_t */
+    semaphores = (sem_t *) data;
 
     /* set cpu affinity */
     CPU_ZERO(&cpuset);
@@ -256,7 +543,8 @@ void *evictor_main(void *data)
     }
 
     /* allocate cache overwriting buffer */
-    buffer = mmap(NULL, cache_size, prot, MAP_PRIVATE | MAP_ANON, -1, 0);
+    buffer = (uint8_t *) mmap(NULL, cache_size, prot,
+                            MAP_PRIVATE | MAP_ANON,-1, 0);
     DIE(buffer == MAP_FAILED, "Unable to create anonymous map (%s)",
         strerror(errno));
 
@@ -297,13 +585,16 @@ void *evictor_main(void *data)
  */
 void *prober_main(void *data)
 {
-    sem_t       *semaphores = data;     /* reference to semaphores        */
+    sem_t       *semaphores;            /* reference to semaphores        */
     cpu_set_t   cpuset;                 /* thread affinity cpu set        */
     uint64_t    delta;                  /* single memory probe duration   */
     uint64_t    total_time = 0;         /* windowed memory probe duration */
     uint64_t    *avg_window;            /* sample window buffer           */
     uint64_t    window_head = 0;        /* sample window head             */
     int32_t     ans;                    /* answer                         */
+
+    /* cast data to sem_t */
+    semaphores = (sem_t *) data;
 
     /* set cpu affinity */
     CPU_ZERO(&cpuset);
@@ -313,7 +604,7 @@ void *prober_main(void *data)
     DIE(ans, "Unable to set cpu affinity (%s)", strerror(errno));
 
     /* allocate and zero out sample window */
-    avg_window = calloc(window_size, sizeof(delta));
+    avg_window = (uint64_t *) calloc(window_size, sizeof(delta));
     DIE(!avg_window, "Unable to allocate sample window buffer (%s)",
         strerror(errno));
 
@@ -359,6 +650,13 @@ int32_t main(int32_t argc, char *argv[])
     static sem_t        semaphores[2];  /* for alternating evict / probe */
     pthread_t           threads[2];     /* evictor / prober threads      */
     int32_t             ans;            /* answer                        */
+
+    /*** test ***/
+    //void *plm = pcmalloc(3072, PROT_READ | PROT_WRITE);
+    //INFO("start_addr = %p", plm);
+    //usleep(1000000000);
+    //return 0;
+    /*** test ***/
 
     /* parse cli arguments */
     ans = argp_parse(&argp, argc, argv, 0, 0, NULL);

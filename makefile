@@ -5,14 +5,14 @@ OBJ = obj
 INC = include
 
 # compilation related parameters
-CC      = gcc
-CFLAGS  = -ggdb
+CXX     = g++
+CFLAGS  = -ggdb -std=c++20
 LDFLAGS = -lpthread -ldl
 
 # identify sources; generate objects and final binary targets
-SOURCES = $(wildcard $(SRC)/*.c)
-OBJECTS = $(patsubst $(SRC)/%.c, $(OBJ)/%.o, $(SOURCES))
-TARGETS = $(patsubst $(SRC)/%.c, $(BIN)/%,   $(SOURCES))
+SOURCES = $(wildcard $(SRC)/*.cpp)
+OBJECTS = $(patsubst $(SRC)/%.cpp, $(OBJ)/%.o, $(SOURCES))
+TARGETS = $(patsubst $(SRC)/%.cpp, $(BIN)/%,   $(SOURCES))
 
 # directive to prevent (attempted) intermediary file/directory deletion
 .PRECIOUS: $(BIN)/ $(OBJ)/
@@ -30,11 +30,11 @@ bear:
 
 # final binary generation rule
 $(BIN)/%: $(OBJ)/%.o | $(BIN)/
-	$(CC) -o $@ $^ $(LDFLAGS)
+	$(CXX) -o $@ $^ $(LDFLAGS)
 
 # object generation rule
-$(OBJ)/%.o: $(SRC)/%.c | $(OBJ)/
-	$(CC) -c -I $(INC) $(CFLAGS) -o $@ $^
+$(OBJ)/%.o: $(SRC)/%.cpp | $(OBJ)/
+	$(CXX) -c -I $(INC) $(CFLAGS) -o $@ $^
 
 # clean rule
 clean:
