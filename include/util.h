@@ -97,6 +97,15 @@
         }                       \
     } while (0)
 
+/* [warning] on assertion, break */
+#define BREAK(assertion, msg...) \
+    do {                        \
+        if (assertion) {        \
+            WAR(msg);           \
+            break;              \
+        }                       \
+    } while (0)
+
 /* [debug] no assertion, just print */
 #define DEBUG(msg...)                                                 \
     do {                                                              \
