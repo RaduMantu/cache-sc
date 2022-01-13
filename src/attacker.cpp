@@ -229,7 +229,7 @@ void dcache_evict(void *data, uint64_t size)
 }
 
 /******************************************************************************
- *************************** CACHE BUFFER ALLOCATOR ***************************
+ ******************* PHYSICALLY CONTINUOUS MEMORY ALLOCATOR *******************
  ******************************************************************************/
 
 /* single entry from /proc/<pid>/pagemap */
@@ -338,7 +338,7 @@ get_unmapped_space_out:
  *  @as : accounting structure to be inserted
  *
  *  @return : starting index of the physically continuous block containing the
- *            page whose accouting structure was just inserted
+ *            page whose accouting structure was just inserted; ~0 on collision
  *
  * The .cfb field contains the total length (in pages) of the physically
  * continuous memory block starting with that page. If the insertion extends
@@ -356,14 +356,10 @@ uint32_t insert_page(vector<struct page_attr>& v, struct page_attr& as)
 
     /* do binary search for left insert location */
     while (lb <= rb) {
-        /* exact match should be impossible */
+        /* exact match should be impossible, but sometimes happens */
         mid = (lb + rb) / 2;
-        if (unlikely(as.pfn == v[mid].pfn)) {
-            WAR("PFN collision detected: %#lx", as.pfn);
-
-            lb = mid;
-            break;
-        }
+        if (unlikely(as.pfn == v[mid].pfn))
+            return ~0;
 
         /* adjust bounds */
         if (as.pfn < v[mid].pfn)
@@ -447,6 +443,8 @@ void *pcmalloc(uint32_t num_pages, int32_t prot)
 
         /* add newly allocated page to accouting */
         head = insert_page(acc, as);
+        CONT(head == ~0, "PFN collision detected (%#lx -> %#lx)",
+            as.va, as.pfn);
 
         /* update new maximum block size if necessary */
         if (acc[head].cfb > max_block_size) {
@@ -502,7 +500,19 @@ pcmalloc_out:
     return (void *) remap_addr;
 }
 
-/* TODO: implement cmfree() */
+/* pcfree - frees pages allocated using pcmalloc()
+ *  @addr      : starting virtual address of allocated block
+ *  @num_pages : number of initially allocated pages
+ */
+void pcfree(void *addr, uint32_t num_pages)
+{
+    int32_t ans;    /* answer */
+
+    for (size_t i = 0; i < num_pages; ++i) {
+        ans = munmap((void *) ((uint64_t) addr + i * 4096), 4096);
+        ALERT(ans == -1, "Unable to unmap page (%s)", strerror(errno));
+    }
+}
 
 /******************************************************************************
  ************************* CORE SPECIFIC MAIN THREADS *************************
@@ -649,13 +659,6 @@ int32_t main(int32_t argc, char *argv[])
     static sem_t        semaphores[2];  /* for alternating evict / probe */
     pthread_t           threads[2];     /* evictor / prober threads      */
     int32_t             ans;            /* answer                        */
-
-    /*** test ***/
-    //void *plm = pcmalloc(3072, PROT_READ | PROT_WRITE);
-    //INFO("start_addr = %p", plm);
-    //usleep(1000000000);
-    //return 0;
-    /*** test ***/
 
     /* parse cli arguments */
     ans = argp_parse(&argp, argc, argv, 0, 0, NULL);
