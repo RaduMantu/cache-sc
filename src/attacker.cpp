@@ -543,15 +543,14 @@ void *evictor_main(void *data)
     }
 
     /* allocate cache overwriting buffer */
-    buffer = (uint8_t *) mmap(NULL, cache_size, prot,
-                            MAP_PRIVATE | MAP_ANON,-1, 0);
-    DIE(buffer == MAP_FAILED, "Unable to create anonymous map (%s)",
-        strerror(errno));
+    buffer = (uint8_t *) pcmalloc(cache_size >> 12, prot);
+    DIE(buffer == MAP_FAILED, "Unable to create cache overwriting buffer");
 
-    /* fault in the buffer pages & initialize according to configuration */
-    memset(buffer, 0x90, cache_size);       /* NOP */
-    if (evict_by_code)
+    /* pages already faulted in; initialize according to configuration */
+    if (evict_by_code) {
+        memset(buffer, 0x90, cache_size);   /* NOP */
         buffer[cache_size - 1] = 0xc3;      /* RET */
+    }
 
     /* main evictor loop (alternating with prober) */
     while (1) {
