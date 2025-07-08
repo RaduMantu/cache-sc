@@ -1,4 +1,4 @@
-### cache-sc
+# cache-sc
 ## Description
 A (mostly) L3 cache side channel attack. The attacker `src/attacker.c` spawns two threads: one focused on cache eviction and the other, on memory probing.
 
